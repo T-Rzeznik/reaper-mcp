@@ -1,0 +1,46 @@
+<evaluation>
+  <!--
+    Answers are keyed to the "MCP Eval Session" reference project (see fixture.md).
+    Load that project before running. All questions are read-only and idempotent.
+  -->
+  <qa_pair>
+    <question>Across every track in the project, find the one whose volume fader is set the quietest (the most negative dB value). What is that track's name?</question>
+    <answer>Pad</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>How many tracks in the project have at least one FX in their chain?</question>
+    <answer>4</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Two different tracks route a send to the same effects bus. Of those two source tracks, which one sends at the louder level (higher dB)? Give the source track's name.</question>
+    <answer>Lead</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Every send in this project is routed to a single shared destination track. What is the name of that destination track?</question>
+    <answer>Reverb Bus</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>The project contains exactly one region (as opposed to a point marker). How many seconds long is it (its end minus its start)? Answer with just the number.</question>
+    <answer>16</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Counting only point markers (not regions), how many are in the project? Answer with just the number.</question>
+    <answer>3</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>What is the project's tempo in BPM? Answer with just the number.</question>
+    <answer>124</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Exactly one track in the project has a compressor (ReaComp) inserted in its FX chain. What is that track's name?</question>
+    <answer>Drums</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Among all tracks, find the one panned furthest to the left. What is its pan value (a number between -1.0 and 1.0)?</question>
+    <answer>-0.3</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Exactly one track in the project contains a media or MIDI item. What is that track's name?</question>
+    <answer>Bass</answer>
+  </qa_pair>
+</evaluation>
