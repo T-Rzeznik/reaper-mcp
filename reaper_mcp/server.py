@@ -1279,6 +1279,42 @@ def reaper_list_items(
 
 
 @mcp.tool(
+    name="reaper_insert_media",
+    annotations={
+        "title": "Insert Media File",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+def reaper_insert_media(
+    track_index: Annotated[int, Field(description="0-based track index to insert onto", ge=0)],
+    file_path: Annotated[
+        str,
+        Field(description="Absolute path to a media file on the machine running Reaper. Audio "
+                          "(wav/aiff/flac/mp3/ogg/...) is added as an audio item; a .mid file is "
+                          "imported as a MIDI item.", min_length=1),
+    ],
+    start_sec: Annotated[
+        float, Field(description="Where to place the item, in seconds from project start", ge=0.0)
+    ] = 0.0,
+) -> dict:
+    """Insert an existing media file (audio or MIDI) onto a track at a given time.
+
+    Use this to bring in samples/loops/one-shots or pre-made MIDI clips from disk. The path
+    must be readable by Reaper's host machine. Returns `{item_index, items_added, track_index,
+    start_sec}`. (This imports existing files; it does not record or synthesize audio.)
+    """
+    return _call(
+        "insert_media",
+        track_index=track_index,
+        file_path=file_path,
+        start_sec=start_sec,
+    )
+
+
+@mcp.tool(
     name="reaper_insert_midi_item",
     annotations={
         "title": "Insert MIDI Item",

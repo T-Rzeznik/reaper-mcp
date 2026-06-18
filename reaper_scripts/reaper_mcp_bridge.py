@@ -626,6 +626,28 @@ def h_insert_midi_item(p):
     return {"item_index": item_index, "position_sec": start, "length_sec": end - start}
 
 
+def h_insert_media(p):
+    tr = _track_at(p["track_index"])
+    path = str(p["file_path"])
+    start = float(p.get("start_sec", 0.0))
+    # InsertMedia drops the file at the edit cursor on the selected track, so aim both first.
+    RPR_SetOnlyTrackSelected(tr)
+    RPR_SetEditCurPos(start, False, False)
+    # InsertMedia(file, mode); mode 0 = add to the currently selected track at the edit cursor.
+    # Works for audio (wav/aiff/mp3/...) and imports .mid files as MIDI items.
+    n = int(RPR_InsertMedia(path, 0))
+    if n < 1:
+        raise ValueError("InsertMedia added nothing (missing file or unsupported format?): %s" % path)
+    item_index = int(RPR_CountTrackMediaItems(tr)) - 1
+    RPR_UpdateArrange()
+    return {
+        "item_index": item_index,
+        "items_added": n,
+        "track_index": int(p["track_index"]),
+        "start_sec": start,
+    }
+
+
 def h_add_midi_note(p):
     tr = _track_at(p["track_index"])
     it = _item_at(tr, p["item_index"])
@@ -793,6 +815,7 @@ HANDLERS = {
     "set_send_volume": h_set_send_volume,
     "remove_send": h_remove_send,
     "list_items": h_list_items,
+    "insert_media": h_insert_media,
     "insert_midi_item": h_insert_midi_item,
     "add_midi_note": h_add_midi_note,
     "add_midi_notes": h_add_midi_notes,

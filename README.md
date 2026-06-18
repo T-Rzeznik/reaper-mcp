@@ -10,12 +10,13 @@ Claude can:
 - Write automation envelopes (track volume/pan or any FX parameter)
 - Set up track sends / routing
 - Create/rename/delete tracks; create/delete media & MIDI items and write MIDI notes (one at a time or a whole part in one batch call)
+- Insert existing media files — audio samples/loops or `.mid` clips — onto a track from disk
 - Add markers and regions; set the time selection and toggle looping
 - Arm tracks and drive the transport (play / stop / record)
 - Render the project using the last-used render settings
 - Trigger any Reaper action by command ID (escape hatch)
 
-All 54 tools are namespaced with a `reaper_` prefix (e.g. `reaper_create_track`) so they
+All 55 tools are namespaced with a `reaper_` prefix (e.g. `reaper_create_track`) so they
 don't collide with other MCP servers. Read tools accept a `response_format` argument
 (`markdown` for humans, `json` for machines).
 
