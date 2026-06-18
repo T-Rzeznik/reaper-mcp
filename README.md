@@ -9,13 +9,13 @@ Claude can:
 - Move volume faders, pan, mute, solo (track and master)
 - Write automation envelopes (track volume/pan or any FX parameter)
 - Set up track sends / routing
-- Create/rename/delete tracks; create/delete media & MIDI items and write MIDI notes
+- Create/rename/delete tracks; create/delete media & MIDI items and write MIDI notes (one at a time or a whole part in one batch call)
 - Add markers and regions; set the time selection and toggle looping
 - Arm tracks and drive the transport (play / stop / record)
 - Render the project using the last-used render settings
 - Trigger any Reaper action by command ID (escape hatch)
 
-All 51 tools are namespaced with a `reaper_` prefix (e.g. `reaper_create_track`) so they
+All 54 tools are namespaced with a `reaper_` prefix (e.g. `reaper_create_track`) so they
 don't collide with other MCP servers. Read tools accept a `response_format` argument
 (`markdown` for humans, `json` for machines).
 
@@ -81,7 +81,7 @@ Ask Claude things like:
 - *"Make a new track called 'Bass', drop Serum on it, and switch to the first preset."* → `reaper_create_track` → `reaper_add_fx_to_track` → `reaper_list_fx_presets` → `reaper_set_fx_preset`
 - *"Automate the volume of track 1 to fade in over the first 4 seconds."* → `reaper_add_envelope_point` × 2
 - *"Send track 2 to a reverb bus and pull the send down 6 dB."* → `reaper_add_send` → `reaper_set_send_volume_db`
-- *"Drop a 2-bar MIDI clip on track 3 and write a C major chord."* → `reaper_insert_midi_item` → `reaper_add_midi_note` × 3
+- *"Drop a 2-bar MIDI clip on track 3 and write a C major chord."* → `reaper_insert_midi_item` → `reaper_add_midi_notes` (all 3 notes in one call)
 - *"Mark the chorus at 32 seconds."* → `reaper_add_marker`
 - *"Arm track 1 and start recording."* → `reaper_set_track_record_arm` → `reaper_transport_record`
 

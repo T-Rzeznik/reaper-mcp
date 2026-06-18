@@ -646,6 +646,34 @@ def h_add_midi_note(p):
     return {"pitch": int(p["pitch"]), "start_sec": start, "length_sec": float(p["length_sec"])}
 
 
+def h_add_midi_notes(p):
+    tr = _track_at(p["track_index"])
+    it = _item_at(tr, p["item_index"])
+    take = RPR_GetActiveTake(it)
+    if _is_null_ptr(take):
+        raise ValueError("item has no active take")
+    notes = p.get("notes") or []
+    if not notes:
+        raise ValueError("notes must be a non-empty list")
+    inserted = []
+    for n in notes:
+        start = float(n["start_sec"])
+        end = start + float(n["length_sec"])
+        start_ppq = RPR_MIDI_GetPPQPosFromProjTime(take, start)
+        end_ppq = RPR_MIDI_GetPPQPosFromProjTime(take, end)
+        # noSortIn=True: defer sorting so the whole batch is sorted once, below
+        RPR_MIDI_InsertNote(
+            take, False, False, start_ppq, end_ppq,
+            int(n.get("channel", 0)), int(n["pitch"]), int(n.get("velocity", 96)), True,
+        )
+        inserted.append(
+            {"pitch": int(n["pitch"]), "start_sec": start, "length_sec": float(n["length_sec"])}
+        )
+    RPR_MIDI_Sort(take)
+    RPR_UpdateArrange()
+    return {"inserted_count": len(inserted), "notes": inserted}
+
+
 def h_delete_item(p):
     tr = _track_at(p["track_index"])
     it = _item_at(tr, p["item_index"])
@@ -767,6 +795,7 @@ HANDLERS = {
     "list_items": h_list_items,
     "insert_midi_item": h_insert_midi_item,
     "add_midi_note": h_add_midi_note,
+    "add_midi_notes": h_add_midi_notes,
     "delete_item": h_delete_item,
     "render_project": h_render_project,
     "render_mixdown": h_render_mixdown,

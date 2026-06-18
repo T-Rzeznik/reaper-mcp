@@ -1296,7 +1296,7 @@ def reaper_insert_midi_item(
     """Create an empty MIDI item on a track spanning [start, end] seconds.
 
     Returns `{item_index, position_sec, length_sec}`. Add notes with
-    `reaper_add_midi_note`.
+    `reaper_add_midi_note` (one note) or `reaper_add_midi_notes` (a whole part at once).
     """
     return _call("insert_midi_item", track_index=track_index, start_sec=start_sec, end_sec=end_sec)
 
@@ -1330,6 +1330,44 @@ def reaper_add_midi_note(
         length_sec=length_sec,
         velocity=velocity,
         channel=channel,
+    )
+
+
+@mcp.tool(
+    name="reaper_add_midi_notes",
+    annotations={
+        "title": "Add MIDI Notes (batch)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+def reaper_add_midi_notes(
+    track_index: Annotated[int, Field(description="0-based track index", ge=0)],
+    item_index: Annotated[int, Field(description="0-based item index from reaper_list_items", ge=0)],
+    notes: Annotated[
+        list[dict],
+        Field(
+            description="List of note objects to insert. Each note is "
+                        "{pitch: int 0-127 (60=middle C), start_sec: float >=0 (project time), "
+                        "length_sec: float >0, velocity?: int 1-127 (default 96), "
+                        "channel?: int 0-15 (default 0)}.",
+            min_length=1,
+        ),
+    ],
+) -> dict:
+    """Insert many MIDI notes into an existing MIDI item in one call.
+
+    Prefer this over repeated `reaper_add_midi_note` when writing a whole part — it
+    inserts every note with sorting deferred and sorts the take once at the end, which
+    is far faster and is a single undo step. Returns `{inserted_count, notes}`.
+    """
+    return _call(
+        "add_midi_notes",
+        track_index=track_index,
+        item_index=item_index,
+        notes=notes,
     )
 
 
