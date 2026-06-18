@@ -7,6 +7,17 @@ dependencies = [
     "mcp[cli]>=1.2.0",
 ]
 
+[project.optional-dependencies]
+# Audio mix analysis (reaper_analyze_mix). Kept optional so the base server
+# stays lightweight; imported lazily inside the tool. `pip install -e .[analyze]`.
+analyze = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "soundfile>=0.12",
+    "pyloudnorm>=0.1.1",
+    "google-genai>=0.3",
+]
+
 [project.scripts]
 reaper-mcp = "reaper_mcp.server:main"
 

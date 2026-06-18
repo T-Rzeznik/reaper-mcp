@@ -370,7 +370,14 @@ def h_transport_play(_p):
     return {"playing": True}
 
 
-def h_transport_stop(_p):
+def h_transport_stop(p):
+    # GetPlayState bitfield: &1 playing, &2 paused, &4 recording.
+    if (int(RPR_GetPlayState()) & 4) and not p.get("force", False):
+        raise RuntimeError(
+            "Reaper is currently recording. Refusing to stop the transport so an "
+            "in-progress take isn't ended unintentionally. Confirm with the user "
+            "that it's OK to stop, then call again with force=true."
+        )
     RPR_OnStopButton()
     return {"stopped": True}
 
@@ -657,6 +664,61 @@ def h_render_project(_p):
     return {"rendered": True}
 
 
+def h_render_mixdown(p):
+    """Quick-export a master-mix file to a caller-chosen dir, return its path.
+
+    Unlike render_project (which reuses the user's manual render dialog as-is),
+    this temporarily overrides the output path/name, render source (master mix)
+    and bounds so the server gets a single predictable file to analyze, then
+    restores every setting it touched. The codec is left as whatever the project
+    is set to (usually WAV) — the server transcodes a small proxy for upload.
+
+    params: out_dir (str), token (filename stem, default 'reaper_mcp_mixdown'),
+    bounds_flag (int: 1 = entire project, 2 = time selection).
+    """
+    import glob
+
+    out_dir = p["out_dir"]
+    token = p.get("token", "reaper_mcp_mixdown")
+    bounds_flag = int(p.get("bounds_flag", 1))
+    pattern = os.path.join(out_dir, token + ".*")
+
+    # Save everything we're about to change so the project is left untouched.
+    saved_file = RPR_GetSetProjectInfo_String(0, "RENDER_FILE", "", False)[3]
+    saved_pat = RPR_GetSetProjectInfo_String(0, "RENDER_PATTERN", "", False)[3]
+    saved_bounds = RPR_GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", 0, False)
+    saved_settings = RPR_GetSetProjectInfo(0, "RENDER_SETTINGS", 0, False)
+
+    # Clear any stale output so the freshly produced file is unambiguous.
+    for stale in glob.glob(pattern):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
+
+    try:
+        RPR_GetSetProjectInfo_String(0, "RENDER_FILE", out_dir, True)
+        RPR_GetSetProjectInfo_String(0, "RENDER_PATTERN", token, True)
+        RPR_GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", bounds_flag, True)
+        RPR_GetSetProjectInfo(0, "RENDER_SETTINGS", 0, True)  # 0 = master mix
+        # 41824 = render using most recent settings, no dialog (synchronous).
+        RPR_Main_OnCommand(41824, 0)
+    finally:
+        RPR_GetSetProjectInfo_String(0, "RENDER_FILE", saved_file, True)
+        RPR_GetSetProjectInfo_String(0, "RENDER_PATTERN", saved_pat, True)
+        RPR_GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", saved_bounds, True)
+        RPR_GetSetProjectInfo(0, "RENDER_SETTINGS", saved_settings, True)
+
+    produced = sorted(glob.glob(pattern), key=os.path.getmtime)
+    if not produced:
+        raise RuntimeError(
+            "Render produced no file. Set the project's render format to a single "
+            "audio file (e.g. WAV or MP3) and render source to 'Master mix'. If using "
+            "bounds_flag=2, make sure a time selection exists."
+        )
+    return {"file": produced[-1], "bounds_flag": bounds_flag}
+
+
 HANDLERS = {
     "ping": h_ping,
     "get_project_info": h_get_project_info,
@@ -707,6 +769,7 @@ HANDLERS = {
     "add_midi_note": h_add_midi_note,
     "delete_item": h_delete_item,
     "render_project": h_render_project,
+    "render_mixdown": h_render_mixdown,
 }
 
 

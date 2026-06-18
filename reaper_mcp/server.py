@@ -64,6 +64,12 @@ class EnvelopeShape(str, Enum):
     BEZIER = "bezier"
 
 
+class GeminiModel(str, Enum):
+    """Which Gemini model listens to the mix in reaper_analyze_mix."""
+    FLASH = "gemini-2.5-flash"
+    PRO = "gemini-2.5-pro"
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers — keep tool bodies thin and DRY.
 # ---------------------------------------------------------------------------
@@ -925,9 +931,26 @@ def reaper_transport_play() -> dict:
         "openWorldHint": True,
     },
 )
-def reaper_transport_stop() -> dict:
-    """Stop the transport."""
-    return _call("transport_stop")
+def reaper_transport_stop(
+    force: Annotated[
+        bool,
+        Field(
+            description=(
+                "Stop even if Reaper is currently recording. Defaults to false: "
+                "if a recording is in progress the call is refused so an in-progress "
+                "take isn't ended unintentionally. Always confirm with the user "
+                "before passing true."
+            ),
+        ),
+    ] = False,
+) -> dict:
+    """Stop the transport.
+
+    If Reaper is recording, the call is refused unless ``force=true`` — this
+    avoids ending a take without the user's go-ahead. Ask the user first, then
+    retry with ``force=true``.
+    """
+    return _call("transport_stop", force=force)
 
 
 @mcp.tool(
@@ -1350,6 +1373,467 @@ def reaper_render_project() -> dict:
     but does not modify the project.
     """
     return _call("render_project")
+
+
+# ---------------------------------------------------------------------------
+# Mix analysis (server-side DSP + Gemini — bypasses the bridge entirely)
+#
+# The bridge is stdlib-only and runs inside Reaper; audio DSP needs numpy etc,
+# so analysis lives here in the server venv (like reaper_list_installed_fx).
+# Precise numbers come from local DSP; Gemini *listens* to the file and grounds
+# its feedback in those measurements. All heavy deps are imported lazily so the
+# server still imports without the optional `[analyze]` extra installed.
+# ---------------------------------------------------------------------------
+
+# (name, low_hz, high_hz) — the bands reported for frequency balance.
+_FREQ_BANDS = [
+    ("sub", 20, 60),
+    ("bass", 60, 120),
+    ("low_mid", 120, 500),
+    ("mid", 500, 2000),
+    ("high_mid", 2000, 6000),
+    ("air", 6000, 20000),
+]
+
+
+def _amp_db(x: float) -> float:
+    """Amplitude ratio -> dB, floored so silence doesn't blow up to -inf."""
+    import math
+    return 20.0 * math.log10(x) if x > 1e-12 else -120.0
+
+
+def _load_audio(path: str):
+    """Read an audio file to float64 samples in [-1, 1], shape (frames, channels)."""
+    import soundfile as sf
+    data, rate = sf.read(path, always_2d=True, dtype="float64")
+    return data, int(rate)
+
+
+def _loudness_metrics(data, rate: float) -> dict:
+    """EBU R128 / BS.1770 loudness, plus peak / crest / clipping (local DSP)."""
+    import numpy as np
+    import pyloudnorm as pyln
+
+    meter = pyln.Meter(rate)
+    try:
+        integrated = float(meter.integrated_loudness(data))
+    except Exception:
+        integrated = float("nan")
+
+    # Short-term (3 s window, 1 s hop) for max loudness and a percentile-based LRA.
+    win, hop = int(3 * rate), int(1 * rate)
+    n = data.shape[0]
+    short_term = []
+    if win > 0:
+        for start in range(0, max(1, n - win + 1), hop):
+            block = data[start:start + win]
+            try:
+                lv = float(meter.integrated_loudness(block))
+            except Exception:
+                continue
+            if np.isfinite(lv) and lv > -70.0:
+                short_term.append(lv)
+    st_max = max(short_term) if short_term else integrated
+    if len(short_term) >= 2:
+        lra = float(np.percentile(short_term, 95) - np.percentile(short_term, 10))
+    else:
+        lra = 0.0
+
+    peak = float(np.max(np.abs(data))) if data.size else 0.0
+    rms = float(np.sqrt(np.mean(np.square(data)))) if data.size else 0.0
+    clipped = int(np.sum(np.abs(data) >= 0.997))
+
+    return {
+        "integrated_lufs": round(integrated, 2) if integrated == integrated else None,
+        "short_term_max_lufs": round(st_max, 2) if st_max == st_max else None,
+        "loudness_range_lu": round(lra, 2),
+        "sample_peak_dbfs": round(_amp_db(peak), 2),
+        "rms_dbfs": round(_amp_db(rms), 2),
+        "crest_factor_db": round(_amp_db(peak) - _amp_db(rms), 2),
+        "clipped_samples": clipped,
+    }
+
+
+def _spectral_balance(data, rate: float) -> dict:
+    """Welch-averaged power per named band, as % of total and dB below total."""
+    import numpy as np
+
+    mono = data.mean(axis=1)
+    n = mono.shape[0]
+    seg = 8192
+    if n < seg:
+        seg = 1 << max(8, int(np.floor(np.log2(max(n, 2)))))
+        seg = min(seg, n)
+    win = np.hanning(seg)
+    step = max(seg // 2, 1)
+
+    psd = np.zeros(seg // 2 + 1)
+    count = 0
+    for start in range(0, n - seg + 1, step):
+        spec = np.fft.rfft(mono[start:start + seg] * win)
+        psd += np.abs(spec) ** 2
+        count += 1
+    if count == 0:  # signal shorter than one segment
+        spec = np.fft.rfft(mono[:seg] * win[:mono[:seg].shape[0]])
+        psd = np.abs(spec) ** 2
+        count = 1
+    psd /= count
+
+    freqs = np.fft.rfftfreq(seg, 1.0 / rate)
+    total = float(psd.sum()) + 1e-20
+    bands = {}
+    for name, lo, hi in _FREQ_BANDS:
+        p = float(psd[(freqs >= lo) & (freqs < hi)].sum())
+        bands[name] = {
+            "pct": round(100.0 * p / total, 1),
+            "db": round(10.0 * np.log10(p / total + 1e-20), 1),
+        }
+    return bands
+
+
+def _stereo_metrics(data) -> dict:
+    """Correlation, mid/side width and L/R balance — mono compatibility cues."""
+    import numpy as np
+
+    if data.shape[1] < 2:
+        return {"channels": 1, "note": "mono file — no stereo metrics"}
+
+    left, right = data[:, 0], data[:, 1]
+    if np.std(left) < 1e-9 or np.std(right) < 1e-9:
+        corr = 1.0
+    else:
+        corr = float(np.corrcoef(left, right)[0, 1])
+
+    mid, side = (left + right) / 2.0, (left - right) / 2.0
+    mid_rms = float(np.sqrt(np.mean(mid ** 2)))
+    side_rms = float(np.sqrt(np.mean(side ** 2)))
+    l_rms = float(np.sqrt(np.mean(left ** 2)))
+    r_rms = float(np.sqrt(np.mean(right ** 2)))
+
+    return {
+        "channels": 2,
+        "correlation": round(corr, 3),
+        "width_side_minus_mid_db": round(_amp_db(side_rms) - _amp_db(mid_rms), 1),
+        "balance_l_minus_r_db": round(_amp_db(l_rms) - _amp_db(r_rms), 2),
+    }
+
+
+def _analyze_audio_file(path: str) -> dict:
+    """Full local-DSP metric set for one audio file."""
+    data, rate = _load_audio(path)
+    return {
+        "file": os.path.basename(path),
+        "sample_rate": rate,
+        "channels": int(data.shape[1]),
+        "duration_sec": round(data.shape[0] / rate, 2) if rate else None,
+        "loudness": _loudness_metrics(data, rate),
+        "frequency_balance": _spectral_balance(data, rate),
+        "stereo": _stereo_metrics(data),
+    }
+
+
+def _make_upload_proxy(src_path: str, max_rate: int = 24000) -> str:
+    """Transcode to a small mono OGG/Vorbis for upload; fall back to the original.
+
+    DSP runs on the full-quality file; Gemini only needs to *hear* the mix, so the
+    upload is shrunk hard (mono, <=24 kHz, Vorbis VBR) — a few-minute song lands
+    around 1 MB instead of tens of MB of WAV. On any failure the original path is
+    returned so the analysis still proceeds (just a bigger upload).
+    """
+    import os
+    import tempfile
+    import soundfile as sf
+    try:
+        data, rate = _load_audio(src_path)
+        mono = data.mean(axis=1)
+        target = min(int(rate), max_rate)
+        if target < int(rate):
+            from math import gcd
+            from scipy.signal import resample_poly
+            g = gcd(target, int(rate))
+            mono = resample_poly(mono, target // g, int(rate) // g)
+            rate = target
+        stem = os.path.splitext(os.path.basename(src_path))[0]
+        out = os.path.join(tempfile.gettempdir(), stem + ".proxy.ogg")
+        sf.write(out, mono.astype("float32"), int(rate), format="OGG", subtype="VORBIS")
+        return out
+    except Exception:
+        return src_path
+
+
+def _upload_gemini_file(client, path: str):
+    """Upload audio to the Gemini Files API and wait until it's ACTIVE."""
+    import time
+    f = client.files.upload(file=path)
+    for _ in range(60):
+        state = getattr(getattr(f, "state", None), "name", str(getattr(f, "state", "")))
+        if state == "ACTIVE":
+            return f
+        if state == "FAILED":
+            raise RuntimeError(f"Gemini failed to process uploaded file '{path}'")
+        time.sleep(1)
+        f = client.files.get(name=f.name)
+    return f
+
+
+def _gemini_mix_feedback(
+    metrics: dict,
+    audio_path: str,
+    ref_metrics: dict | None,
+    ref_path: str | None,
+    focus: str,
+    model: GeminiModel,
+) -> str:
+    """Send the audio + measured metrics to Gemini and return its written critique."""
+    from google import genai
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not set. Export your Google AI Studio key, e.g. "
+            "$env:GEMINI_API_KEY='...' before starting the MCP server, or call with "
+            "include_ai=false to get the measured metrics only."
+        )
+    client = genai.Client(api_key=api_key)
+
+    extra = f"\n\nThe user specifically wants you to focus on: {focus}" if focus.strip() else ""
+    prompt = (
+        "You are a senior mixing and mastering engineer reviewing a track for an artist who "
+        "works in REAPER. You are given (1) precise measurements computed by DSP and (2) the "
+        "actual audio to listen to. TRUST THE MEASURED NUMBERS for loudness, peaks and band "
+        "balance — do not invent your own figures — but use your ears for everything the "
+        "numbers can't capture (tonal character, masking, transients, depth, musicality).\n\n"
+        f"MEASURED METRICS (mix):\n```json\n{json.dumps(metrics, indent=2)}\n```\n"
+    )
+    if ref_metrics is not None:
+        prompt += (
+            f"\nMEASURED METRICS (reference track to compare against):\n```json\n"
+            f"{json.dumps(ref_metrics, indent=2)}\n```\n"
+        )
+    prompt += (
+        "\nWrite concise, actionable feedback in markdown with these sections:\n"
+        "1. **Overall** — one-paragraph verdict and how close it is to release-ready.\n"
+        "2. **Loudness & dynamics** — interpret LUFS / true-ish peak / crest / LRA; is it "
+        "competitive and safe for streaming (~-14 LUFS) without crushing dynamics?\n"
+        "3. **Frequency balance** — call out muddy / thin / harsh / dull bands using the "
+        "measured distribution + what you hear.\n"
+        "4. **Stereo & width** — mono compatibility (correlation), width, L/R balance.\n"
+        "5. **Fixes in REAPER** — concrete moves with stock plugins (ReaEQ, ReaComp, ReaXcomp, "
+        "JS stereo/width tools, ReaLimit) including rough frequencies / amounts.\n"
+        "Be specific and brief; prefer bullet points over prose."
+        + extra
+    )
+
+    proxies: list[str] = []
+    main_proxy = _make_upload_proxy(audio_path)
+    proxies.append(main_proxy)
+    contents: list = [prompt, _upload_gemini_file(client, main_proxy)]
+    if ref_path:
+        ref_proxy = _make_upload_proxy(ref_path)
+        proxies.append(ref_proxy)
+        contents.append("Reference track audio follows:")
+        contents.append(_upload_gemini_file(client, ref_proxy))
+
+    try:
+        resp = client.models.generate_content(model=model.value, contents=contents)
+        return resp.text or "_(Gemini returned no text)_"
+    finally:
+        for pth in proxies:  # only delete proxies we created, never the source
+            if pth.endswith(".proxy.ogg"):
+                try:
+                    os.remove(pth)
+                except OSError:
+                    pass
+
+
+def _format_metrics_md(m: dict) -> str:
+    """Render one file's metric dict as compact markdown."""
+    lines = [
+        f"**{m['file']}** — {m['duration_sec']}s, {m['channels']}ch @ {m['sample_rate']} Hz",
+        "",
+        "_Loudness / mastering_",
+        _to_markdown(m["loudness"]),
+        "",
+        "_Frequency balance (% of energy / dB below total)_",
+        _to_markdown([{"band": k, **v} for k, v in m["frequency_balance"].items()]),
+        "",
+        "_Stereo / width_",
+        _to_markdown(m["stereo"]),
+    ]
+    return "\n".join(lines)
+
+
+def _run_mix_analysis(
+    audio_path: str,
+    focus: str,
+    reference_path: str,
+    include_ai: bool,
+    model: GeminiModel,
+    response_format: ResponseFormat,
+) -> str:
+    """Shared core: measure one (or two) files, optionally ask Gemini, format output.
+
+    Used by both reaper_analyze_mix (caller-supplied file) and reaper_analyze_project
+    (freshly rendered file). The caller guarantees audio_path exists.
+    """
+    if reference_path and not os.path.isfile(reference_path):
+        raise RuntimeError(f"Reference file not found: {reference_path}")
+
+    try:
+        metrics = _analyze_audio_file(audio_path)
+        ref_metrics = _analyze_audio_file(reference_path) if reference_path else None
+    except ModuleNotFoundError as e:
+        raise RuntimeError(
+            f"Missing analysis dependency ({e.name}). Install with: pip install -e .[analyze]"
+        ) from e
+
+    ai_feedback = None
+    if include_ai:
+        ai_feedback = _gemini_mix_feedback(
+            metrics, audio_path, ref_metrics, reference_path or None, focus, model,
+        )
+
+    if response_format == ResponseFormat.JSON:
+        return json.dumps(
+            {"metrics": metrics, "reference_metrics": ref_metrics, "ai_feedback": ai_feedback},
+            indent=2, default=str,
+        )
+
+    out = ["## Measured metrics", "", _format_metrics_md(metrics)]
+    if ref_metrics is not None:
+        out += ["", "### Reference", "", _format_metrics_md(ref_metrics)]
+    if ai_feedback is not None:
+        out += ["", "## AI mix feedback (Gemini)", "", ai_feedback]
+    return "\n".join(out)
+
+
+@mcp.tool(
+    name="reaper_analyze_mix",
+    annotations={
+        "title": "Analyze Mix",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+def reaper_analyze_mix(
+    audio_path: Annotated[
+        str,
+        Field(description="Path to the rendered audio file to analyze (WAV/MP3/FLAC/AAC). "
+                          "Render the project first (reaper_render_project) and pass that file."),
+    ],
+    focus: Annotated[
+        str,
+        Field(description="Optional free-text note on what to focus on, passed to Gemini "
+                          "(e.g. 'the vocal sounds buried', 'too boomy on small speakers').",
+              max_length=500),
+    ] = "",
+    reference_path: Annotated[
+        str,
+        Field(description="Optional path to a reference/commercial track to compare against."),
+    ] = "",
+    include_ai: Annotated[
+        bool,
+        Field(description="If true, send the audio + metrics to Gemini for written feedback. "
+                          "If false, return only the measured DSP metrics (no API call)."),
+    ] = True,
+    model: Annotated[
+        GeminiModel,
+        Field(description="Gemini model that listens to the mix: 'gemini-2.5-flash' (fast/cheap) "
+                          "or 'gemini-2.5-pro' (deeper analysis)."),
+    ] = GeminiModel.FLASH,
+    response_format: _FMT = ResponseFormat.MARKDOWN,
+) -> str:
+    """Analyze a rendered mix: local DSP measurements + AI listening feedback.
+
+    Two layers. Local DSP (numpy/pyloudnorm) measures the trustworthy numbers —
+    integrated LUFS, loudness range, sample peak, crest factor, clipped samples,
+    per-band frequency balance, and stereo correlation/width/balance. Then (unless
+    include_ai=false) Gemini is given BOTH the audio file and those measurements and
+    returns grounded mix/master feedback with concrete REAPER fixes.
+
+    Requires the optional deps: `pip install -e .[analyze]`, and GEMINI_API_KEY in the
+    environment for the AI layer. Pass a reference_path to compare against a pro track.
+
+    This reads files and calls an external API; it never modifies the Reaper project.
+    """
+    if not os.path.isfile(audio_path):
+        raise RuntimeError(f"Audio file not found: {audio_path}")
+    return _run_mix_analysis(
+        audio_path, focus, reference_path, include_ai, model, response_format,
+    )
+
+
+class RenderBounds(str, Enum):
+    """What span reaper_analyze_project renders before analyzing."""
+    PROJECT = "project"
+    TIME_SELECTION = "time_selection"
+
+
+@mcp.tool(
+    name="reaper_analyze_project",
+    annotations={
+        "title": "Analyze Project (render + analyze)",
+        "readOnlyHint": False,  # writes a temp render file to disk
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+def reaper_analyze_project(
+    focus: Annotated[
+        str,
+        Field(description="Optional free-text note on what to focus on, passed to Gemini "
+                          "(e.g. 'the vocal sounds buried', 'too boomy on small speakers').",
+              max_length=500),
+    ] = "",
+    reference_path: Annotated[
+        str,
+        Field(description="Optional path to a reference/commercial track to compare against."),
+    ] = "",
+    bounds: Annotated[
+        RenderBounds,
+        Field(description="Render the whole 'project' or just the current 'time_selection'."),
+    ] = RenderBounds.PROJECT,
+    include_ai: Annotated[
+        bool,
+        Field(description="If true, send a small audio proxy + metrics to Gemini for written "
+                          "feedback. If false, return only the measured DSP metrics (no API call)."),
+    ] = True,
+    model: Annotated[
+        GeminiModel,
+        Field(description="Gemini model that listens to the mix: 'gemini-2.5-flash' (fast/cheap) "
+                          "or 'gemini-2.5-pro' (deeper analysis)."),
+    ] = GeminiModel.FLASH,
+    response_format: _FMT = ResponseFormat.MARKDOWN,
+) -> str:
+    """One-call mix check: quick-export the master mix, then analyze it.
+
+    This is the convenient path — no need to pre-configure the render dialog or pass
+    a file. It tells Reaper to render the master mix to a temp file (reusing your
+    project's render codec, e.g. WAV), measures it with local DSP (LUFS, peak, crest,
+    per-band balance, stereo width), then — unless include_ai=false — uploads a small
+    compressed proxy plus those measurements to Gemini for grounded feedback.
+
+    Requires the optional deps (`pip install -e .[analyze]`) and GEMINI_API_KEY for the
+    AI layer. For best results set the project's render source to 'Master mix' and format
+    to a single audio file. Writes a temp render but does not modify the project.
+    """
+    bounds_flag = 1 if bounds == RenderBounds.PROJECT else 2
+    import tempfile
+    result = _call(
+        "render_mixdown",
+        out_dir=tempfile.gettempdir(),
+        token="reaper_mcp_mixdown",
+        bounds_flag=bounds_flag,
+    )
+    audio_path = result.get("file") if isinstance(result, dict) else None
+    if not audio_path or not os.path.isfile(audio_path):
+        raise RuntimeError(f"Render did not produce a readable file (got: {result!r})")
+    return _run_mix_analysis(
+        audio_path, focus, reference_path, include_ai, model, response_format,
+    )
 
 
 # ---------------------------------------------------------------------------
