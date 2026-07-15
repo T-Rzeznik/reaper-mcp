@@ -1408,6 +1408,36 @@ def reaper_add_midi_notes(
 
 
 @mcp.tool(
+    name="reaper_read_midi",
+    annotations={
+        "title": "Read MIDI Notes",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+def reaper_read_midi(
+    track_index: Annotated[int, Field(description="0-based track index", ge=0)],
+    item_index: Annotated[int, Field(description="0-based item index from reaper_list_items", ge=0)],
+    response_format: _FMT = ResponseFormat.MARKDOWN,
+) -> str:
+    """Read every MIDI note from an existing MIDI item's active take.
+
+    Returns one row per note, sorted by start time: `{index, pitch, note, start_sec,
+    length_sec, velocity, channel, muted}` (`note` is the name, e.g. 60 -> "C4"). Times are
+    in seconds of project time, matching the write tools, so you can read a part back and
+    feed edits straight into `reaper_add_midi_notes`. Use this to inspect a clip you or the
+    user already wrote before changing it. Returns an empty result for an empty item; raises
+    if the item's active take is not MIDI.
+    """
+    return _render(
+        _call("read_midi", track_index=track_index, item_index=item_index),
+        response_format,
+    )
+
+
+@mcp.tool(
     name="reaper_delete_item",
     annotations={
         "title": "Delete Item",

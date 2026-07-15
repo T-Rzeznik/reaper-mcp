@@ -696,6 +696,47 @@ def h_add_midi_notes(p):
     return {"inserted_count": len(inserted), "notes": inserted}
 
 
+_NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+
+def _note_name(pitch):
+    # MIDI 60 -> "C4" (the convention the pitch numbers in the write tools use)
+    return "%s%d" % (_NOTE_NAMES[int(pitch) % 12], (int(pitch) // 12) - 1)
+
+
+def h_read_midi(p):
+    tr = _track_at(p["track_index"])
+    it = _item_at(tr, p["item_index"])
+    take = RPR_GetActiveTake(it)
+    if _is_null_ptr(take):
+        raise ValueError("item has no active take")
+    if not RPR_TakeIsMIDI(take):
+        raise ValueError("active take is not MIDI (nothing to read)")
+    # MIDI_CountEvts(take, notecnt, ccevtcnt, textsyxevtcnt) -> (retval, take, notecnt, cc, txt)
+    note_count = int(RPR_MIDI_CountEvts(take, 0, 0, 0)[2])
+    notes = []
+    for i in range(note_count):
+        # MIDI_GetNote(take, idx, selected, muted, startppq, endppq, chan, pitch, vel)
+        # -> (retval, take, idx, selected, muted, startppq, endppq, chan, pitch, vel)
+        r = RPR_MIDI_GetNote(take, i, False, False, 0.0, 0.0, 0, 0, 0)
+        if not r[0]:
+            continue
+        start_sec = float(RPR_MIDI_GetProjTimeFromPPQPos(take, r[5]))
+        end_sec = float(RPR_MIDI_GetProjTimeFromPPQPos(take, r[6]))
+        notes.append({
+            "index": i,
+            "pitch": int(r[8]),
+            "note": _note_name(r[8]),
+            "start_sec": round(start_sec, 6),
+            "length_sec": round(end_sec - start_sec, 6),
+            "velocity": int(r[9]),
+            "channel": int(r[7]),
+            "muted": bool(r[4]),
+        })
+    notes.sort(key=lambda n: (n["start_sec"], n["pitch"]))
+    return notes
+
+
 def h_delete_item(p):
     tr = _track_at(p["track_index"])
     it = _item_at(tr, p["item_index"])
@@ -819,6 +860,7 @@ HANDLERS = {
     "insert_midi_item": h_insert_midi_item,
     "add_midi_note": h_add_midi_note,
     "add_midi_notes": h_add_midi_notes,
+    "read_midi": h_read_midi,
     "delete_item": h_delete_item,
     "render_project": h_render_project,
     "render_mixdown": h_render_mixdown,
